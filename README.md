@@ -350,7 +350,7 @@ network behaviour under acute in silico perturbation:
 This hierarchy indicates that glycosylation networks act as **proximal encoders of stable
 ageing-related molecular state**, while DNA repair pathways function as **upstream buffers
 of acute physiological stress** without directly encoding ageing clock architecture.  Acute
-high-intensity exercise validation confirmed rapid modulation of terminal plasma
+high-intensity exercise validation in a human experimental trial confirmed rapid modulation of terminal plasma
 glycosylation features (galactosylation, sialylation) alongside activation of DNA repair
 programmes (SIRT1, PARP1, RAD51), providing biological grounding for the distinct network
 roles observed in silico.
