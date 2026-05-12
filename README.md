@@ -1,0 +1,2 @@
+# Causal-Graph-Perturbation-Modelling-of-Exercise-Biology-Resolving-Biological-Ageing-Pathways
+A causal perturbation framework integrating Mendelian randomisation, self-supervised graph learning, and PPR network diffusion to resolve which exercise-responsive molecular pathways encode stable biological ageing state versus buffer acute physiological stress. Preprint: https://doi.org/10.64898/2026.02.01.26345311
