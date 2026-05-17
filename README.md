@@ -1,0 +1,531 @@
+# In Silico Network Perturbation Reveals Hierarchical Roles of DNA Repair and Glycosylation Linking Exercise to Human Ageing Clocks
+
+**Ciara G. Juan · Lazaros Ntasis**  
+*medRxiv preprint · February 2026*  
+[https://doi.org/10.64898/2026.02.01.26345311](https://doi.org/10.64898/2026.02.01.26345311)
+
+---
+
+## Overview
+
+This repository contains the complete codebase for the in silico perturbation framework
+described in the paper.  The pipeline integrates four stages:
+
+1. **Contrastive pretraining** — learns task-agnostic gene embeddings via SimCLR-style
+   self-supervision on node feature vectors.
+2. **MR-informed embedding refinement** — aligns the embedding space with causally
+   anchored exercise biology by predicting masked Mendelian randomisation (MR) effect
+   sizes across four omic layers simultaneously.
+3. **In silico perturbation + network diffusion** — simulates acute single-event gene-level
+   perturbations and propagates them across the gene interaction network using
+   Personalised PageRank (PPR).  Two variants:
+   - `perturb_diffusion.py` — topology metrics only (Gini, entropy, concentration).
+   - `perturb_diffusion_with_DMRimpact.py` — adds quantitative alignment with epigenetic
+     clock DMR gene sets and the proteomic ageing PC1 axis, each evaluated against
+     degree-matched null models.
+4. **External evaluation** — validates learned embeddings by predicting held-out ageing
+   targets (DMR summaries, proteomic PC1) using frozen embeddings as features.
+5. **Biology vs topology analysis** — tests whether the glycosylation vs DNA repair
+   diffusion hierarchy is driven by biological features or network position, using
+   degree-corrected Gini residuals, clustering coefficient analysis, embedding
+   perturbation correlations, and class-level Mann-Whitney comparisons. Both
+   first-order (degree) and second-order (clustering) topology confounds are
+   explicitly tested and ruled out.
+
+**No ageing labels are used during training** (Steps 1–2).  Associations with ageing
+clocks in Steps 3–4 therefore reflect network topology and causal exercise signals rather
+than supervised optimisation toward ageing outcomes.
+
+---
+
+## Design Decisions
+
+The table below documents the key architectural and methodological choices made in this
+framework, the alternatives that were considered and rejected, and the reasons.
+These decisions are documented here to support reproducibility and to make the
+scientific reasoning transparent.
+
+| Decision | Choice made | Alternative rejected | Reason |
+|---|---|---|---|
+| Self-supervised pretraining method | SimCLR NT-Xent contrastive loss with feature dropout augmentation | Masked autoencoder (MAE) | Node features are tabular multi-omic vectors, not images or sequences. MAE requires spatial or positional structure to define a meaningful reconstruction target. NT-Xent with feature dropout forces the encoder to learn which features are consistently informative vs noise — appropriate for tabular biology |
+| MR refinement loss | Huber loss (δ=1.0) per omic layer | MSE | MR beta distributions have heavy tails from pleiotropic instruments and weak instrument bias. MSE squares large residuals, causing the loss to be dominated by unreliable outlier MR estimates. Huber degrades to L1 for large residuals, making refinement robust to noisy instruments |
+| Stability regularisation | L2 penalty on embedding shift: `λ\|\|Z' − Z\|\|²` (λ=1×10⁻⁴) | No regularisation | Without the stability term, the MR refinement projection network collapses the contrastive embedding topology — it trivially minimises multi-task MR loss by ignoring pretraining geometry. The L2 penalty preserves the contrastive structure while allowing MR alignment |
+| Masking strategy for missing MR | Loss computed only on genes with valid (non-NaN) MR estimates per layer | Mean imputation of missing betas | Imputing missing MR estimates would introduce false causal signal. Masking ensures the model only learns from genes with actual MR evidence in each layer, preserving the integrity of the causal anchor |
+| PPR teleportation parameter | α=0.85 (strong locality bias) | α=0.5 (more global diffusion) | High α keeps diffusion local — it asks how much influence a perturbation has in the immediate neighbourhood rather than globally. This is biologically appropriate: gene perturbations have localised network effects before signal decays. Lower α produces diffuse spreading that is harder to interpret as a perturbation fingerprint |
+| Null model design | Degree-matched null (2,000 samples per gene) | Random null (uniform sampling) | Network degree is a confound — high-degree genes attract more PPR mass regardless of biology. Degree-matched nulls test whether a gene's diffusion pattern is unusual *given its network position*, not just unusual globally. Random nulls would inflate false positives for hub genes |
+| Contrastive vs MR refinement split | Two-stage: unsupervised pretraining then MR-supervised refinement | End-to-end supervised training on MR targets from scratch | End-to-end training would collapse the representation to predict MR betas directly, losing the structural and functional gene similarity information captured by contrastive pretraining. The two-stage design allows the first stage to learn general gene biology before the second stage biases it toward causal exercise signals |
+| External evaluation design | Degree-stratified train/test splits with frozen embeddings + Ridge regression | Random splits | Random splits allow hub genes (high degree, more training data in GNN) to dominate test performance. Degree-stratified splits evaluate generalisation across the full topology spectrum. Frozen embeddings ensure no ageing labels leak into training at any stage |
+
+---
+
+## Repository structure
+
+```
+insilico_exercise_ageing/
+├── src/
+│   ├── train_contrastive.py                  # Step 1: contrastive pretraining
+│   ├── finetune_multitask_mr.py              # Step 2: MR-informed refinement
+│   ├── perturb_diffusion.py                  # Step 3a: perturbation (topology metrics)
+│   ├── perturb_diffusion_with_DMRimpact.py   # Step 3b: perturbation + ageing annotation
+│   ├── eval_external_targets.py             # Step 4: external ageing evaluation
+│   └── perturb_biology_vs_topology.py       # Step 5: biology vs topology analysis
+├── data/
+│   └── expected_format/
+│       └── DATA_FORMAT.md                   # Expected column schemas for all inputs
+├── results/                                 # Output directory (created at runtime)
+├── requirements.txt
+├── .gitignore
+└── README.md
+```
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/cgjuan01/insilico_exercise_ageing
+cd insilico_exercise_ageing
+
+# Python 3.10+ required
+pip install -r requirements.txt
+```
+
+GPU is optional; all scripts fall back to CPU automatically.
+
+---
+
+## Full pipeline
+
+The four scripts are designed to run sequentially.  Data file names below match the
+naming conventions used in the paper; see `data/expected_format/DATA_FORMAT.md` for
+exact column specifications.
+
+---
+
+### Step 1 — Contrastive pretraining
+
+**Script:** `src/train_contrastive.py`
+
+Learns gene embeddings using SimCLR-style NT-Xent loss.  Two stochastic views of each
+node are generated by independent feature-level dropout; the MLP encoder is trained to
+maximise agreement between views of the same gene while pushing all other genes apart
+within each batch.
+
+**Method details:**
+- Two augmented views per gene via feature dropout (default `p = 0.2`).
+- NT-Xent loss with in-batch negatives (temperature = 0.2).
+- MLP encoder: Linear → ReLU → Dropout → Linear.
+- 500 epochs, Adam (lr = 1×10⁻³, weight decay = 1×10⁻⁵).
+
+```bash
+python src/train_contrastive.py \
+  --features   data/paper2_nodes_features_SSL_noPAN_noMR_zscored.tsv \
+  --edge_index data/paper2_edge_index_int.tsv \
+  --gene_index data/paper2_gene_to_index.tsv \
+  --outdir     results/step1_contrastive \
+  --emb_dim    128 \
+  --hid_dim    256 \
+  --epochs     500 \
+  --lr         1e-3 \
+  --temperature 0.2 \
+  --feature_dropout 0.2 \
+  --seed       42
+```
+
+**Outputs:**
+| File | Description |
+|------|-------------|
+| `embeddings_contrastive.tsv` | gene_symbol, index, emb_1 … emb_128 |
+| `training_log_contrastive.tsv` | epoch, loss |
+
+---
+
+### Step 2 — MR-informed masked multi-task embedding refinement
+
+**Script:** `src/finetune_multitask_mr.py`
+
+Refines the contrastive embeddings by training a lightweight projection network to
+predict standardised MR effect sizes (beta_std) across four omic layers simultaneously:
+proteomics, CpG methylation, glycomics, and single-cell transcriptomics.
+
+**Method details:**
+- Projection: `Z → Z'` (Linear → ReLU → Dropout → Linear, fixed dimensionality).
+- One regression head per omic layer: Linear → ReLU → Dropout → Linear → scalar.
+- Masking: loss is computed **only** for genes with a valid (non-NaN) MR estimate in
+  each layer; missing values are not imputed.
+- Huber loss (δ = 1.0) per task, summed across layers.
+- Stability regularisation: `L2 penalty × ||Z' − Z||²` (default λ = 1×10⁻⁴) preserves
+  the topology learned during contrastive pretraining.
+- 500 epochs, Adam (lr = 1×10⁻³, weight decay = 1×10⁻⁵).
+
+```bash
+python src/finetune_multitask_mr.py \
+  --gene_index  data/paper2_gene_to_index.tsv \
+  --mr_targets  data/paper2_targets_MR_multitask_beta_std.tsv \
+  --embeddings  results/step1_contrastive/embeddings_contrastive.tsv \
+  --outdir      results/step2_mrrefined \
+  --proj_hid    256 \
+  --head_hid    128 \
+  --dropout     0.2 \
+  --epochs      500 \
+  --lr          1e-3 \
+  --delta       1.0 \
+  --l2_embed    1e-4 \
+  --seed        42
+```
+
+**Outputs:**
+| File | Description |
+|------|-------------|
+| `embeddings_mrrefined.tsv` | gene_symbol, index, emb_1 … emb_128 |
+| `training_log_mrrefined.tsv` | epoch, loss_total, loss_shift, loss_{task} |
+
+---
+
+### Step 3a — In silico perturbation (topology metrics)
+
+**Script:** `src/perturb_diffusion.py`
+
+Simulates acute single-event gene-level perturbations and propagates them via PPR
+diffusion.  Outputs ranked lists of affected genes and quantifies diffusion breadth
+(Shannon entropy) and concentration (Gini coefficient), evaluated against degree-matched
+null models.
+
+**Perturbation model:**
+```
+z_g' = (1 + s) × z_g   [overexpression]
+z_g' = (1 − s) × z_g   [knockdown]
+Δ_g  = ||z_g' − z_g||₂  (impact score scaling)
+impact_i = p_i × Δ_g
+```
+
+**Diffusion model (PPR power iteration):**
+```
+p^(t+1) = (1 − α) e_g + α D⁻¹ A p^(t)
+```
+Default: α = 0.85, 50 iterations.
+
+**Null model:** For each perturbed gene, 2000 degree-matched null seeds are sampled
+and diffusion is recomputed under identical parameters.  Two-sided empirical p-values
+are computed as:
+```
+p_emp = (#{|x_null − μ| ≥ |x_obs − μ|} + 1) / (n_null + 1)
+```
+
+```bash
+# Single gene
+python src/perturb_diffusion.py \
+  --embeddings results/step2_mrrefined/embeddings_mrrefined.tsv \
+  --gene_index data/paper2_gene_to_index.tsv \
+  --edge_index data/paper2_edge_index_int.tsv \
+  --gene       B4GALT1 \
+  --mode       overexpression \
+  --strength   1.0 \
+  --alpha      0.85 \
+  --n_iter     50 \
+  --null_n     2000 \
+  --outdir     results/step3a_perturb \
+  --seed       42
+
+# Multiple genes (glycosylation + DNA repair panel)
+python src/perturb_diffusion.py \
+  --embeddings results/step2_mrrefined/embeddings_mrrefined.tsv \
+  --gene_index data/paper2_gene_to_index.tsv \
+  --edge_index data/paper2_edge_index_int.tsv \
+  --genes      B4GALT1,ST6GAL1,ST3GAL1,ST3GAL4,MGAT3,MGAT5,MGAT5B,SIRT1,PARP1,RAD51 \
+  --mode       overexpression \
+  --strength   1.0 \
+  --alpha      0.85 \
+  --n_iter     50 \
+  --null_n     2000 \
+  --topk       200 \
+  --outdir     results/step3a_perturb \
+  --seed       42
+```
+
+**Outputs (under `--outdir`):**
+```
+perturb_summary_all.tsv          # combined summary across all perturbed genes
+<GENE>_OE/
+    affected_genes.tsv           # all genes ranked by diffusion_score
+    null_degree_matched.tsv      # null distributions for concentration/entropy
+    perturb_summary.tsv          # single-row summary with empirical p-values
+```
+
+**Key columns in `perturb_summary_all.tsv`:**
+| Column | Description |
+|--------|-------------|
+| `degree` | Network degree of the perturbed gene |
+| `entropy_ppr` | Shannon entropy of PPR distribution (breadth) |
+| `gini_ppr` | Gini coefficient of PPR distribution (concentration) |
+| `top10/50/200_ppr_mass` | Cumulative PPR mass in top-K genes |
+| `emp_p_entropy/gini` | Empirical p-values vs degree-matched null |
+
+---
+
+### Step 3b — In silico perturbation with ageing-clock annotation
+
+**Script:** `src/perturb_diffusion_with_DMRimpact.py`
+
+Extends Step 3a with three families of quantitative ageing-clock alignment metrics,
+each evaluated against degree-matched null models:
+
+**(A) Epigenetic clock DMR gene sets** (Horvath, Hannum, PhenoAge, DunedinPACE)  
+Diffusion mass captured within the top-K neighbourhood by clock DMR genes.  Optional
+per-gene weighting by `n_DMRs` or `mean_abs_delta`.
+
+**(B) Proteomic ageing PC1 axis**  
+Diffusion-mass-weighted sum of |PC1 loading| over all genes: `Σ p_i × |PC1_i|`.
+
+**(C) Glyco7 validated enzyme panel**  
+Default: `B4GALT1, ST6GAL1, ST3GAL1, ST3GAL4, MGAT3, MGAT5, MGAT5B`.
+
+Uses vectorised `np.add.at` diffusion (faster than the adjacency-list loop in Step 3a)
+and accepts gene-symbol edge lists directly (no pre-mapped integer indices required).
+
+```bash
+python src/perturb_diffusion_with_DMRimpact.py \
+  --nodes          data/paper2_nodes_symbol.tsv \
+  --edges          data/paper2_edges_symbol.tsv \
+  --genes          B4GALT1,ST6GAL1,ST3GAL1,ST3GAL4,MGAT3,MGAT5,MGAT5B,SIRT1,PARP1,RAD51 \
+  --genes_extra    SIRT3,SIRT6,OGG1 \
+  --mode           overexpression \
+  --strength       1.0 \
+  --alpha          0.85 \
+  --n_iter         50 \
+  --null_n         2000 \
+  --topk           200 \
+  --dmr_horvath    data/paper2_dmr_horvath.tsv \
+  --dmr_hannum     data/paper2_dmr_hannum.tsv \
+  --dmr_phenoage   data/paper2_dmr_phenoage.tsv \
+  --dmr_dunedinpace data/paper2_dmr_dunedinpace.tsv \
+  --dmr_weight     mean_abs_delta \
+  --pc1_proteomic  data/paper2_proteomic_PC1_loadings.tsv \
+  --glyco7         B4GALT1,ST6GAL1,ST3GAL1,ST3GAL4,MGAT3,MGAT5,MGAT5B \
+  --outdir         results/step3b_perturb_annotated \
+  --seed           42
+```
+
+**Additional output columns** (vs Step 3a):
+| Column | Description |
+|--------|-------------|
+| `Glyco7_mass_total/topk` | PPR mass captured by Glyco7 panel |
+| `Glyco7_emp_p_mass_total/topk` | Empirical p-values vs null |
+| `PC1_mass_total/topk` | PC1-weighted diffusion mass |
+| `<Clock>_dmr_mass_total/topk` | DMR-set PPR mass per clock |
+| `<Clock>_dmr_wmass_total/topk` | Weighted DMR mass (if `--dmr_weight != none`) |
+| `<Clock>_emp_p_dmr_mass_*` | Empirical p-values per clock |
+
+---
+
+### Step 4 — External evaluation of embeddings on ageing targets
+
+**Script:** `src/eval_external_targets.py`
+
+Validates whether the learned embeddings encode ageing-relevant structure using
+**frozen** embeddings as input features to a regularised linear model.  No ageing
+labels are used at any point during training (Steps 1–2), so predictive performance
+here reflects unsupervised generalisation.
+
+**Design:**
+- Ridge or Elastic Net regression on predefined degree-stratified splits.
+- Spearman ρ on the held-out test set + permutation p-value (2000 resamples).
+- R² on the test set.
+
+```bash
+# With contrastive embeddings (baseline)
+python src/eval_external_targets.py \
+  --embeddings results/step1_contrastive/embeddings_contrastive.tsv \
+  --targets    data/paper2_targets_external_epiclocks_proteomicPC1.tsv \
+  --splits     data/paper2_splits_degreeStratified.tsv \
+  --outdir     results/step4_eval_contrastive \
+  --split_col  set_801010 \
+  --model      ridge \
+  --alpha      1.0 \
+  --n_perm     2000
+
+# With MR-refined embeddings (main result)
+python src/eval_external_targets.py \
+  --embeddings results/step2_mrrefined/embeddings_mrrefined.tsv \
+  --targets    data/paper2_targets_external_epiclocks_proteomicPC1.tsv \
+  --splits     data/paper2_splits_degreeStratified.tsv \
+  --outdir     results/step4_eval_mrrefined \
+  --split_col  set_801010 \
+  --model      ridge \
+  --alpha      1.0 \
+  --n_perm     2000
+```
+
+**Outputs:**
+| File | Description |
+|------|-------------|
+| `results_external_metrics.tsv` | One row per target: R², Spearman ρ, permutation p |
+| `predictions_<target>.tsv` | Per-gene y_true / y_pred on the test set |
+
+---
+
+## Key biological findings
+
+The framework distinguishes two classes of exercise-responsive genes based on their
+network behaviour under acute in silico perturbation:
+
+| Gene class | Examples | Diffusion profile | Clock alignment |
+|---|---|---|---|
+| Glycosylation enzymes | B4GALT1, ST6GAL1, ST3GAL1, ST3GAL4, MGAT3, MGAT5, MGAT5B | High Gini, low entropy (concentrated) | Enriched (p < 0.01) |
+| DNA repair / stress response | PARP1, SIRT1, RAD51 | Low Gini, high entropy (diffuse) | Not enriched (p > 0.1) |
+
+This hierarchy indicates that glycosylation networks act as **proximal encoders of stable
+ageing-related molecular state**, while DNA repair pathways function as **upstream buffers
+of acute physiological stress** without directly encoding ageing clock architecture.  Acute
+high-intensity exercise validation in a human experimental trial confirmed rapid modulation of terminal plasma
+glycosylation features (galactosylation, sialylation) alongside activation of DNA repair
+programmes (SIRT1, PARP1, RAD51), providing biological grounding for the distinct network
+roles observed in silico.
+
+---
+
+
+---
+
+## Step 5 — Biology vs topology analysis
+
+**Script:** `src/perturb_biology_vs_topology.py`
+
+### What it does
+
+Tests whether the glycosylation vs DNA repair diffusion hierarchy is driven by
+biological features or network topology. PPR diffusion is a closed-form mathematical
+formula — there are no learned weights, so gradient-based attribution is not applicable.
+This script uses correlation analysis instead, which is the appropriate method for a
+non-parametric diffusion model.
+
+Four analyses are performed:
+
+**Analysis 1 — Gini vs degree residual**
+Fits a line of `gini_ppr` on `degree`. Genes above the line show more concentrated
+diffusion than their degree alone predicts. Glycosylation genes consistently show
+positive residuals; DNA repair genes show negative residuals. Controls for
+first-order topology.
+
+**Analysis 2 — Embedding perturbation magnitude vs diffusion**
+Tests whether `dz_norm` (the L2 norm of the embedding change under perturbation, which
+scales the PPR seed) correlates with diffusion concentration. If topology drove the
+result, `dz_norm` and `gini_ppr` should be uncorrelated.
+
+**Analysis 3 — Class-level comparison on degree-normalised metrics**
+Compares glycosylation vs DNA repair genes on Gini residuals, Shannon entropy,
+top-10 PPR mass, and `dz_norm`, using Mann-Whitney U tests with effect size r.
+
+**Analysis 4 — Clustering coefficient analysis** (requires `--edge_path`)
+Tests the higher-order topology confound that degree alone does not capture.
+Computes per-gene clustering coefficient — the fraction of a gene's neighbours
+that are also connected to each other. A high clustering coefficient means a gene
+sits inside a tight clique; PPR mass could recirculate within that clique regardless
+of biology. Fits a line of Gini vs clustering, computes clustering-corrected
+residuals, and compares glycosylation vs DNA repair on those residuals with
+Mann-Whitney U.
+
+**Optional Analysis 5** — If both contrastive and MR-refined embeddings are provided,
+computes per-gene embedding shift from MR refinement (`||z_refined − z_contrastive||`)
+and correlates with diffusion concentration.
+
+**Optional Analysis 6** — If Step 3b output is provided, correlates clock-DMR mass
+with degree and Gini residual to test whether clock alignment is independent of
+network position.
+
+### Key results from the data
+
+With the glycosylation and DNA repair panel (n=10 genes), verified against
+`perturb_summary_all.tsv` and `GNN_edges_EXERCISE_1-23.tsv`:
+
+| Analysis | Result | Interpretation |
+|---|---|---|
+| Raw Gini difference | p=0.067, not significant | Low power with 10 genes |
+| **Degree-corrected Gini residual** | **p=0.033, r=0.67, significant** | Hierarchy survives degree correction |
+| Shannon entropy | p=0.033, Repair > Glyco | Consistent with diffuse vs concentrated |
+| **Clustering vs Gini** | **r=0.086, p=0.812** | Clustering explains almost nothing |
+| **Clustering-corrected residual** | **Glyco > Repair, direction preserved** | Hierarchy survives clustering correction |
+
+**The two critical findings:**
+1. The degree-corrected Gini residual is significant at p=0.033 — once degree is
+   removed, the hierarchy becomes *clearer*, not weaker. This rules out degree as
+   the driver.
+2. Clustering explains almost none of the Gini variance (r=0.086, p=0.812). MGAT3
+   has a clustering coefficient of 0.956 — the tightest clique in the panel — but
+   that clique structure does not predict its concentrated diffusion. This rules out
+   local clique structure as the driver.
+
+Together these two analyses rule out both first-order (degree) and second-order
+(clustering) topology as explanations for the glycosylation diffusion hierarchy.
+
+### Usage
+
+```bash
+# Minimal — degree analysis only, no edge file needed
+python src/perturb_biology_vs_topology.py \
+    --perturb_summary results/step3a_perturb/perturb_summary_all.tsv \
+    --out_dir         biology_vs_topology_outputs
+
+# With clustering analysis — recommended
+python src/perturb_biology_vs_topology.py \
+    --perturb_summary results/step3a_perturb/perturb_summary_all.tsv \
+    --edge_path       data/GNN_edges_EXERCISE_1-23.tsv \
+    --out_dir         biology_vs_topology_outputs
+
+# Full — with Step 3b clock-DMR output and embeddings
+python src/perturb_biology_vs_topology.py \
+    --perturb_summary        results/step3a_perturb/perturb_summary_all.tsv \
+    --edge_path              data/GNN_edges_EXERCISE_1-23.tsv \
+    --perturb_dmr            results/step3b_perturb_annotated/perturb_summary_all.tsv \
+    --embeddings_contrastive results/step1_contrastive/embeddings_contrastive.tsv \
+    --embeddings_mrrefined   results/step2_mrrefined/embeddings_mrrefined.tsv \
+    --out_dir                biology_vs_topology_outputs
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `--perturb_summary` | yes | Step 3a `perturb_summary_all.tsv` |
+| `--edge_path` | no | Edge TSV (from/to columns, gene symbols). Required for clustering analysis |
+| `--perturb_dmr` | no | Step 3b summary with clock-DMR mass columns |
+| `--embeddings_contrastive` | no | Step 1 contrastive embeddings |
+| `--embeddings_mrrefined` | no | Step 2 MR-refined embeddings |
+| `--out_dir` | no | Output directory (default: `biology_vs_topology_outputs`) |
+
+### Output files
+
+| File | Description |
+|---|---|
+| `gini_vs_degree.png/tsv` | Analysis 1: Gini vs degree scatter with residuals |
+| `embedding_perturbation_vs_diffusion.png/tsv` | Analysis 2: dz_norm vs Gini and entropy |
+| `class_comparison.png/tsv` | Analysis 3: Glycosylation vs DNA repair Mann-Whitney results |
+| `gini_vs_clustering.png/tsv` | Analysis 4: Gini vs clustering coefficient with residuals |
+| `embedding_shift_vs_gini.png/tsv` | Analysis 5: MR embedding shift vs Gini (if embeddings provided) |
+| `dmr_mass_correlation.tsv` | Analysis 6: Clock-DMR mass vs degree and Gini residual (if Step 3b provided) |
+| `summary_report.txt` | Plain-language interpretation of all results including honest limitations |
+
+## Citation
+
+```bibtex
+@article{juan2026insilico,
+  title   = {In Silico Network Perturbation Reveals Hierarchical Roles of DNA Repair and
+             Glycosylation Linking Exercise to Human Ageing Clocks},
+  author  = {Juan, Ciara G. and Ntasis, Lazaros},
+  journal = {medRxiv},
+  year    = {2026},
+  doi     = {10.64898/2026.02.01.26345311}
+}
+```
+
+---
+
+## Data availability
+
+Input data files are available at [https://github.com/cgjuan01](https://github.com/cgjuan01).
+See `data/expected_format/DATA_FORMAT.md` for complete column specifications.
+
+---
+
+## License
+
+All rights reserved.  No reuse without permission (preprint terms).  
+Contact the corresponding author for data or code licensing enquiries.
