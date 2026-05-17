@@ -413,7 +413,7 @@ and correlates with diffusion concentration.
 with degree and Gini residual to test whether clock alignment is independent of
 network position.
 
-### Key results from your data
+### Key results from the data
 
 With the glycosylation and DNA repair panel (n=10 genes), verified against
 `perturb_summary_all.tsv` and `GNN_edges_EXERCISE_1-23.tsv`:
